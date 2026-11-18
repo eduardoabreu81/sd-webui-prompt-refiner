@@ -1,8 +1,12 @@
 # Prompt Refiner for SD WebUI Forge Neo
 
 Rewrite and expand image prompts using a supported text encoder you already have
-in Forge Neo. The extension adds a **Prompt Refiner** tab and runs locally inside
-Forge, without LM Studio, Ollama, or a separate language-model server.
+in Forge Neo. The extension adds a **Prompt Refiner** accordion to txt2img and
+img2img and runs locally inside Forge, without LM Studio, Ollama, or a separate
+language-model server.
+
+This is a fork of [AMGarkin/sd-webui-prompt-refiner](https://github.com/AMGarkin/sd-webui-prompt-refiner)
+that moves the refiner from its own tab into the generation tabs.
 
 ## Install
 
@@ -18,11 +22,15 @@ packages; it does not install or upgrade them.
 1. Place a supported `.safetensors` or `.gguf` text encoder in
    `<forge>/models/text_encoder/`. Subfolders, `models/text_encoders/`, and Forge's
    extra text encoder directory are also searched. Refresh the list after adding files.
-2. Open **Prompt Refiner** and select the encoder. Leave **Model family** on **Auto**
-   and the tokenizer directory empty unless setup requires an override.
-3. Enter your idea, choose a system prompt preset, and click **Refine prompt**.
-4. Review the result, then click **Send to txt2img** or **Send to img2img**.
-   **Use result as input** lets you refine it again.
+2. In txt2img or img2img, open the **Prompt Refiner** accordion and select the encoder.
+   Leave **Model family** on **Auto** and the tokenizer directory empty unless setup
+   requires an override.
+3. Enter your idea, or leave **Idea** empty to refine the tab's current prompt.
+   Choose a system prompt preset and click **Refine prompt**.
+4. Review the result, then click **Apply to prompt** to replace the tab's prompt.
+   Extra-network tags such as `<lora:name:1>` are not sent to the language model;
+   tags from the current prompt are kept and added after the result.
+   **Use result as idea** lets you refine it again.
 
 Expand **System prompt & presets** to edit instructions. **Save preset** updates
 an existing name; change the name to save a copy. Presets can also be deleted,

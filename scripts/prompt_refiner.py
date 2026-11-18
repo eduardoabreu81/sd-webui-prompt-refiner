@@ -1,7 +1,8 @@
 """
-Prompt Refiner - extension for Forge Classic / Neo
+Prompt Refiner - extension for Forge Neo
 
-Adds a "Prompt Refiner" tab that rewrites / expands prompts with a local LLM.
+Adds a "Prompt Refiner" accordion to txt2img and img2img that rewrites / expands
+the tab's prompt with a local LLM.
 The LLM is the very same text encoder file you already use for image generation
 (e.g. qwen3vl_4b_fp8_scaled.safetensors from models/text_encoder).
 No Ollama / LM Studio / external server is needed.
@@ -29,7 +30,7 @@ from pathlib import Path
 import gradio as gr
 import torch
 
-from modules import script_callbacks, shared
+from modules import scripts, shared
 from modules.paths import models_path, script_path
 
 EXT_DIR = Path(__file__).resolve().parents[1]
@@ -341,9 +342,13 @@ def _create_lm_head(repo_id, as_int8, token):
     key = None
     fname = "model.safetensors"
     try:
+        from huggingface_hub.errors import EntryNotFoundError
+    except ImportError:  # older huggingface_hub
+        from huggingface_hub.utils import EntryNotFoundError
+    try:
         idx = hf_hub_download(repo_id, "model.safetensors.index.json", token=token)
-    except Exception:
-        idx = None  # single-file repo
+    except EntryNotFoundError:
+        idx = None  # single-file repo; access, gated-repo and network errors are reported as they are
     if idx:
         wm = json.loads(Path(idx).read_text(encoding="utf-8"))["weight_map"]
         key = next((k for k in wm if k.endswith("lm_head.weight")), None)
@@ -798,23 +803,65 @@ def run_refine(
 
 
 # --------------------------------------------------------------------------------------
-# UI
+# UI: an accordion in txt2img and img2img
 # --------------------------------------------------------------------------------------
 
-SEND_JS = """
+# An empty idea field uses the tab's current prompt instead, without extra-network
+# tags such as <lora:name:1>, which the language model would rewrite or drop.
+FILL_IDEA_JS = r"""
+(...args) => {
+    if (!args[1] || !args[1].trim()) {
+        const ta = gradioApp().querySelector('#TAB_prompt textarea');
+        args[1] = (ta ? ta.value : '')
+            .replace(/<[^<>]+>/g, ' ')
+            .replace(/\s*,(\s*,)+/g, ',')
+            .replace(/\s+/g, ' ')
+            .replace(/^[\s,]+|[\s,]+$/g, '');
+    }
+    return args;
+}
+"""
+
+# Replacing the prompt keeps its extra-network tags that the result does not already contain.
+APPLY_JS = r"""
 (text) => {
     const ta = gradioApp().querySelector('#TAB_prompt textarea');
-    if (ta) {
-        ta.value = text;
-        ta.dispatchEvent(new Event('input', {bubbles: true}));
-    }
-    if (typeof switch_to_TAB === 'function') { switch_to_TAB(); }
+    if (!ta || !text || !text.trim()) { return []; }
+    const tags = [...new Set(ta.value.match(/<[^<>]+>/g) || [])].filter((tag) => !text.includes(tag));
+    ta.value = [text.trim(), ...tags].join(' ');
+    ta.dispatchEvent(new Event('input', {bubbles: true}));
     return [];
 }
 """
 
+# txt2img and img2img build their own controls but share one settings store, so a
+# change saved from one tab is never reverted by a later change in the other.
+_SETTINGS = {"store": None}
 
-def on_ui_tabs():
+
+def _settings_for(controls):
+    if _SETTINGS["store"] is None:
+        choices = {
+            key: [choice[1] for choice in control.choices] + ([None] if control.value is None else [])
+            for key, control in controls.items() if isinstance(control, gr.Dropdown)
+        }
+        ranges = {
+            key: (control.minimum, control.maximum)
+            for key, control in controls.items() if isinstance(control, gr.Slider)
+        }
+        _SETTINGS["store"] = SettingsStore(SETTINGS_FILE, {key: control.value for key, control in controls.items()},
+                                           choices, ranges)
+    return _SETTINGS["store"]
+
+
+def _blocks(block):
+    yield block
+    for child in getattr(block, "children", None) or []:
+        yield from _blocks(child)
+
+
+def build_ui(tab):
+    """Build the refiner inside an accordion of the txt2img or img2img tab."""
     preset_message = ""
     try:
         presets = load_presets()
@@ -825,13 +872,7 @@ def on_ui_tabs():
     preset_names = list(presets.keys())
     encoders = list_encoders()
 
-    with gr.Blocks(analytics_enabled=False) as ui:
-        gr.Markdown(
-            "Rewrite or expand prompts with your Qwen3, Qwen3-VL, Qwen2.5-VL, or Qwen3.5 9B text encoder (safetensors / GGUF). "
-            "Runs locally inside Forge - no Ollama or LM Studio needed."
-        )
-        # Keep prompt editing and generation controls visible; uncommon settings
-        # belong in collapsed sections below the main two-column workspace.
+    with gr.Accordion("Prompt Refiner", open=False, elem_id=f"prompt_refiner_{tab}_accordion") as accordion:
         with gr.Row():
             encoder = gr.Dropdown(
                 label="Text encoder (models/text_encoder)", choices=encoders,
@@ -840,37 +881,37 @@ def on_ui_tabs():
             refresh_btn = gr.Button("🔄", elem_classes=["tool"], scale=1, min_width=40)
         with gr.Row():
             with gr.Column(scale=1):
-                prompt = gr.Textbox(label="Your prompt / idea", lines=8, placeholder="a cat astronaut on mars, cinematic")
+                prompt = gr.Textbox(
+                    label="Idea", lines=4,
+                    placeholder="Leave empty to refine this tab's current prompt (<lora:...> tags are kept out and restored)",
+                )
                 with gr.Row():
                     run_btn = gr.Button("Refine prompt", variant="primary", scale=4)
                     stop_btn = gr.Button("Stop", scale=1)
-                preset = gr.Dropdown(label="System prompt preset", choices=preset_names,
-                                     value=preset_names[0] if preset_names else None)
-                max_new = gr.Slider(32, 4096, value=768, step=16, label="Max new tokens")
-                empty_think = gr.Checkbox(value=True, label="Disable thinking via chat template (switchable Qwen3 / Qwen3.5 only)",
-                                          info="Dedicated Thinking-2507 checkpoints cannot disable thinking.")
-                with gr.Accordion("System prompt & presets", open=False):
-                    system_prompt = gr.Textbox(label="System prompt (instructions for the LLM)", lines=9,
-                                               value=presets[preset_names[0]] if preset_names else "")
-                    with gr.Row():
-                        preset_name = gr.Textbox(label="Preset name", scale=3, placeholder="Name for a new preset",
-                                                 value=preset_names[0] if preset_names else "",
-                                                 info="Keep this name to update the preset, or change it to save a copy.")
-                        save_btn = gr.Button("Save preset", scale=1)
-                        delete_btn = gr.Button("Delete selected preset", scale=1)
-                    preset_status = gr.Textbox(label="Preset status", value=preset_message, interactive=False, lines=2)
-
             with gr.Column(scale=1):
-                output = gr.Textbox(label="Result", lines=14, interactive=True, show_copy_button=True)
+                output = gr.Textbox(label="Result", lines=6, interactive=True, show_copy_button=True)
                 with gr.Row():
-                    send_txt = gr.Button("Send to txt2img")
-                    send_img = gr.Button("Send to img2img")
-                    reuse_btn = gr.Button("Use result as input")
-                progress_html = gr.HTML(value="")
-                status = gr.Textbox(label="Status", interactive=False, lines=2)
-                with gr.Accordion("Model details", open=False):
-                    model_details = gr.Textbox(label="Loaded model details", interactive=False, lines=5)
-                    unload_btn = gr.Button("Unload model")
+                    apply_btn = gr.Button("Apply to prompt", variant="primary")
+                    reuse_btn = gr.Button("Use result as idea")
+        with gr.Row():
+            preset = gr.Dropdown(label="System prompt preset", choices=preset_names,
+                                 value=preset_names[0] if preset_names else None, scale=3)
+            max_new = gr.Slider(32, 4096, value=768, step=16, label="Max new tokens", scale=2)
+            empty_think = gr.Checkbox(value=True, label="Disable thinking (switchable Qwen3 / Qwen3.5 only)",
+                                      info="Dedicated Thinking-2507 checkpoints cannot disable thinking.", scale=2)
+        progress_html = gr.HTML(value="")
+        status = gr.Textbox(label="Status", interactive=False, lines=1)
+
+        with gr.Accordion("System prompt & presets", open=False):
+            system_prompt = gr.Textbox(label="System prompt (instructions for the LLM)", lines=9,
+                                       value=presets[preset_names[0]] if preset_names else "")
+            with gr.Row():
+                preset_name = gr.Textbox(label="Preset name", scale=3, placeholder="Name for a new preset",
+                                         value=preset_names[0] if preset_names else "",
+                                         info="Keep this name to update the preset, or change it to save a copy.")
+                save_btn = gr.Button("Save preset", scale=1)
+                delete_btn = gr.Button("Delete selected preset", scale=1)
+            preset_status = gr.Textbox(label="Preset status", value=preset_message, interactive=False, lines=2)
 
         with gr.Accordion("Sampling options", open=False):
             gr.Markdown(
@@ -895,7 +936,7 @@ def on_ui_tabs():
                 family = gr.Dropdown(models.FAMILIES, value="Auto", label="Model family",
                                      info="Override Auto for renamed encoders with ambiguous architecture.", scale=1)
                 tokenizer_override = gr.Textbox(label="Tokenizer directory (optional)", scale=3,
-                                               placeholder="Leave empty to use matching local Forge tokenizer files")
+                                                placeholder="Leave empty to use matching local Forge tokenizer files")
             with gr.Row():
                 device = gr.Dropdown(["auto (GPU if available)", "cuda", "cpu"], value="auto (GPU if available)", label="Device")
                 dtype = gr.Dropdown(["auto", "bfloat16", "float16", "float32"], value="auto", label="Compute dtype")
@@ -936,6 +977,10 @@ def on_ui_tabs():
                 lm_btn = gr.Button("Download lm_head")
             lm_status = gr.HTML(value="")
 
+        with gr.Accordion("Model details", open=False):
+            model_details = gr.Textbox(label="Loaded model details", interactive=False, lines=5)
+            unload_btn = gr.Button("Unload model")
+
         # Persist only explicitly listed controls. Prompt/result text, unsaved
         # instructions, preset-name drafts, download tokens, and status are excluded.
         controls = {
@@ -949,15 +994,7 @@ def on_ui_tabs():
             "keep_quantized": keep_q, "compress": compress,
             "lm_head": lm_choice, "lm_head_int8": lm_int8, "lm_head_repo": lm_repo,
         }
-        choices = {
-            key: [choice[1] for choice in control.choices] + ([None] if control.value is None else [])
-            for key, control in controls.items() if isinstance(control, gr.Dropdown)
-        }
-        ranges = {
-            key: (control.minimum, control.maximum)
-            for key, control in controls.items() if isinstance(control, gr.Slider)
-        }
-        settings = SettingsStore(SETTINGS_FILE, {key: control.value for key, control in controls.items()}, choices, ranges)
+        settings = _settings_for(controls)
         for key, control in controls.items():
             control.value = settings.values[key]
         system_prompt.value = presets.get(preset.value, "")
@@ -966,71 +1003,81 @@ def on_ui_tabs():
         settings_status = gr.Textbox(label="Settings status", value=settings.message,
                                      visible=bool(settings.message), interactive=False)
 
-        def _remember(key):
-            """Bind a single control to avoid overwriting other concurrent changes."""
-            def changed(value):
-                message = settings.update(key, value)
-                return gr.update(value=message, visible=bool(message))
-            return changed
+    def _remember(key):
+        """Bind a single control to avoid overwriting other concurrent changes."""
+        def changed(value):
+            message = settings.update(key, value)
+            return gr.update(value=message, visible=bool(message))
+        return changed
 
-        for key, control in controls.items():
-            control.change(_remember(key), inputs=[control], outputs=[settings_status], show_progress="hidden")
+    for key, control in controls.items():
+        control.change(_remember(key), inputs=[control], outputs=[settings_status], show_progress="hidden")
 
-        # ---- events ----
-        sampling_reset.click(
-            lambda: tuple(SAMPLING_DEFAULTS.values()),
-            inputs=[], outputs=[controls[key] for key in SAMPLING_DEFAULTS],
-            show_progress="hidden",
-        )
-        def _refresh(current):
-            names = list_encoders()
-            return gr.update(choices=names, value=current if current in names else (names[0] if names else None))
+    # ---- events ----
+    sampling_reset.click(
+        lambda: tuple(SAMPLING_DEFAULTS.values()),
+        inputs=[], outputs=[controls[key] for key in SAMPLING_DEFAULTS],
+        show_progress="hidden",
+    )
 
-        refresh_btn.click(_refresh, inputs=[encoder], outputs=[encoder])
-        lm_refresh.click(lambda cur: gr.update(choices=["Auto"] + list_lm_heads(), value=cur),
-                         inputs=[lm_choice], outputs=[lm_choice])
-        lm_source.input(lambda name: KNOWN_HEAD_SOURCES.get(name, ""), inputs=[lm_source], outputs=[lm_repo])
-        lm_repo.input(lambda repo: next((name for name, value in KNOWN_HEAD_SOURCES.items() if value == repo), next(iter(KNOWN_HEAD_SOURCES))),
-                      inputs=[lm_repo], outputs=[lm_source])
-        lm_btn.click(create_lm_head_ui, inputs=[lm_repo, lm_int8, lm_token], outputs=[lm_status, lm_choice],
-                     show_progress="hidden")
+    def _refresh(current):
+        names = list_encoders()
+        return gr.update(choices=names, value=current if current in names else (names[0] if names else None))
 
-        # Only user selection reloads the editor; programmatic dropdown updates
-        # must not clear the success/error message from a save or deletion.
-        preset.input(select_preset_ui, inputs=[preset], outputs=[system_prompt, preset_name, preset_status])
-        save_btn.click(change_preset_ui, inputs=[preset_name, system_prompt],
-                       outputs=[preset, system_prompt, preset_name, preset_status])
-        delete_btn.click(lambda name: change_preset_ui(name, delete=True), inputs=[preset],
-                         outputs=[preset, system_prompt, preset_name, preset_status])
+    refresh_btn.click(_refresh, inputs=[encoder], outputs=[encoder])
+    lm_refresh.click(lambda cur: gr.update(choices=["Auto"] + list_lm_heads(), value=cur),
+                     inputs=[lm_choice], outputs=[lm_choice])
+    lm_source.input(lambda name: KNOWN_HEAD_SOURCES.get(name, ""), inputs=[lm_source], outputs=[lm_repo])
+    lm_repo.input(lambda repo: next((name for name, value in KNOWN_HEAD_SOURCES.items() if value == repo), next(iter(KNOWN_HEAD_SOURCES))),
+                  inputs=[lm_repo], outputs=[lm_source])
+    lm_btn.click(create_lm_head_ui, inputs=[lm_repo, lm_int8, lm_token], outputs=[lm_status, lm_choice],
+                 show_progress="hidden")
 
-        def _run_with_details(*args):
-            """Keep routine status short and put model diagnostics in their own panel."""
-            for result, message, progress in run_refine(*args):
-                summary, _, details = message.partition("\n")
-                yield result, summary, progress, details
+    # Only user selection reloads the editor; programmatic dropdown updates
+    # must not clear the success/error message from a save or deletion.
+    preset.input(select_preset_ui, inputs=[preset], outputs=[system_prompt, preset_name, preset_status])
+    save_btn.click(change_preset_ui, inputs=[preset_name, system_prompt],
+                   outputs=[preset, system_prompt, preset_name, preset_status])
+    delete_btn.click(lambda name: change_preset_ui(name, delete=True), inputs=[preset],
+                     outputs=[preset, system_prompt, preset_name, preset_status])
 
-        run_btn.click(
-            _run_with_details,
-            inputs=[encoder, prompt, system_prompt, temperature, top_p, top_k, min_p, rep_penalty,
-                    max_new, seed, device, dtype, rope, keep_loaded, free_vram, empty_think, keep_q, compress, lm_choice, family, tokenizer_override, presence],
-            outputs=[output, status, progress_html, model_details],
-            show_progress="hidden",
-        )
-        stop_btn.click(lambda: _STOP.set(), inputs=None, outputs=None)
-        reuse_btn.click(lambda t: t, inputs=[output], outputs=[prompt])
-        unload_btn.click(lambda: (unload_model(), ""), outputs=[status, model_details])
+    def _run_with_details(*args):
+        """Keep routine status short and put model diagnostics in their own panel."""
+        for result, message, progress in run_refine(*args):
+            summary, _, details = message.partition("\n")
+            yield result, summary, progress, details
 
-        send_txt.click(fn=None, inputs=[output], outputs=None, js=SEND_JS.replace("TAB", "txt2img"))
-        send_img.click(fn=None, inputs=[output], outputs=None, js=SEND_JS.replace("TAB", "img2img"))
+    run_btn.click(
+        _run_with_details,
+        inputs=[encoder, prompt, system_prompt, temperature, top_p, top_k, min_p, rep_penalty,
+                max_new, seed, device, dtype, rope, keep_loaded, free_vram, empty_think, keep_q, compress, lm_choice, family, tokenizer_override, presence],
+        outputs=[output, status, progress_html, model_details],
+        show_progress="hidden",
+        js=FILL_IDEA_JS.replace("TAB", tab),
+    )
+    stop_btn.click(lambda: _STOP.set(), inputs=None, outputs=None)
+    reuse_btn.click(lambda t: t, inputs=[output], outputs=[prompt])
+    unload_btn.click(lambda: (unload_model(), ""), outputs=[status, model_details])
+    apply_btn.click(fn=None, inputs=[output], outputs=None, js=APPLY_JS.replace("TAB", tab))
 
-    # Forge applies ui-config.json after rendering extension tabs. Its older
-    # defaults must not overwrite settings.json or restore text/secrets that this
-    # extension deliberately excludes from persistence. Use Neo's opt-out on all
-    # controls, including transient prompt, result, editor, and status fields.
-    for component in ui.blocks.values():
+    # Forge applies ui-config.json after the tab is built. Its older defaults must
+    # not overwrite settings.json or restore text/secrets that this extension
+    # deliberately excludes from persistence, so every control opts out.
+    for component in _blocks(accordion):
         component.do_not_save_to_config = True
+    return accordion
 
-    return [(ui, "Prompt Refiner", "prompt_refiner")]
 
+class PromptRefinerScript(scripts.Script):
+    create_group = False
 
-script_callbacks.on_ui_tabs(on_ui_tabs)
+    def title(self):
+        return "Prompt Refiner"
+
+    def show(self, is_img2img):
+        return scripts.AlwaysVisible
+
+    def ui(self, is_img2img):
+        # Refinement only edits the prompt box; it passes nothing to image generation.
+        build_ui("img2img" if is_img2img else "txt2img")
+        return []

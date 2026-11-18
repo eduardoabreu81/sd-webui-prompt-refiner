@@ -103,10 +103,14 @@ Qwen3.5 uses the extension's local decoder with Forge's Transformers 4.x package
 
 ## Controls, settings, and presets
 
-The prompt and result are side by side, with refinement controls below the prompt
-and transfer buttons below the result. Preset selection, **Max new tokens**, and
-**Disable thinking via chat template** are available beside the prompt; disabling
-thinking is checked by default for switchable Qwen3 models. Expand **System prompt
+The refiner is an accordion in txt2img and img2img. The idea and result are side
+by side, with refinement controls below the idea and **Apply to prompt** below the
+result. An empty idea uses the tab's current prompt with extra-network tags
+(`<...>`) removed; applying the result keeps the current prompt's tags that the
+result does not already contain. Preset selection, **Max new tokens**, and
+**Disable thinking** are below them; disabling thinking is checked by default for
+switchable Qwen3 models. Both tabs share one loaded model and one `settings.json`;
+a change saved in one tab is shown in the other after Forge restarts. Expand **System prompt
 & presets** to edit instructions or manage presets. **Sampling options** and
 **Advanced model settings** are collapsed by default. The short status appears
 below the result; expand **Model details** for tokenizer, quantization, device,
