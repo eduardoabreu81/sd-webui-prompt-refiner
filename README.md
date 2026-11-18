@@ -24,6 +24,11 @@ install, and restart Forge. You can also clone the repository into
 Use an up-to-date **Forge Neo** installation. The extension reuses Forge's Python
 packages; it does not install or upgrade them.
 
+After installing or updating, restart Forge and reload the browser page with
+**Ctrl+F5**. A page left open from before the restart sends outdated requests,
+which shows up in the console as `KeyError` or "didn't receive enough input
+values" errors from many extensions.
+
 ## Quick start
 
 1. Place a supported `.safetensors` or `.gguf` text encoder in
@@ -53,9 +58,29 @@ default; dedicated thinking-only models cannot reliably disable reasoning.
 
 The refiner only writes text, so **it does not need the same encoder as your
 image model**: a Qwen3-VL 4B encoder can write prompts for MOSS-Image, Anima, or
-any other model. For speed, prefer **Qwen3-VL 4B** or **Qwen3 4B** stored as
-**INT8 / INT8 ConvRot or scaled FP8** on an NVIDIA GPU, and enable **Keep the
-refiner model loaded between runs** in Settings if you have spare VRAM.
+any other model.
+
+**Recommended setup:**
+
+- **Encoder:** Qwen3-VL 4B (or Qwen3 4B) stored as **INT8 / INT8 ConvRot or scaled
+  FP8**, on an NVIDIA GPU.
+- **Settings > Prompt Refiner > Model:** enable **Keep the refiner model loaded
+  between runs** if you have spare VRAM. A 4B encoder keeps about 4-5 GB loaded,
+  and each new refinement starts at once instead of reloading it from disk.
+
+Why 4B is usually the best choice:
+
+- **Fastest path.** 4B encoders run on the standard Transformers model, and INT8 /
+  FP8 weights use a dedicated Triton kernel for each generated token.
+- **Room to spare.** A 4B encoder fits comfortably on an 8 GB card together with
+  its caches; a 9B encoder sits close to the limit even when it fits.
+- **The task is small.** Rewriting a prompt is short and guided by the system
+  prompt. A 9B model can write somewhat better text, but the difference in the
+  final image is usually small next to the extra time.
+
+Tested on an 8 GB card: Qwen3-VL 4B INT8 ConvRot refines comfortably, while a
+Qwen3.5 9B W4A8 encoder works with **Keep input embeddings in system RAM** but
+remains noticeably slower.
 
 Avoid larger or slower paths unless you need them: **Qwen3.5 9B** runs on the
 extension's own PyTorch decoder, **W4A8/W6A8** and **GGUF** can decompress every
