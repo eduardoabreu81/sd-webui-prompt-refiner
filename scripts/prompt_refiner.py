@@ -16,13 +16,11 @@ MoE, other model families, and image inputs are not supported.
 import gc
 import html
 import json
-import os
 import queue
 import random
 import re
 import sys
 import threading
-import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -30,7 +28,8 @@ from pathlib import Path
 import gradio as gr
 import torch
 
-from modules import scripts, shared
+from modules import script_callbacks, scripts, shared
+from modules.options import categories
 from modules.paths import models_path, script_path
 
 EXT_DIR = Path(__file__).resolve().parents[1]
@@ -39,13 +38,11 @@ if str(EXT_DIR) not in sys.path:
 
 # Forge imports extension scripts without guaranteeing their root is on sys.path.
 from prompt_refiner_lib import checkpoints, models  # noqa: E402
-from prompt_refiner_lib.preferences import SettingsStore  # noqa: E402
 from prompt_refiner_lib.sampling import SAMPLING_DEFAULTS, sampling_kwargs  # noqa: E402
 from prompt_refiner_lib.lm_heads import KNOWN_HEAD_SOURCES, MissingLMHeadError  # noqa: E402
 from prompt_refiner_lib.quantization import PackedLinear, QuantLinear, _FP8_TRITON, _TRITON  # noqa: E402
 
 PRESETS_FILE = EXT_DIR / "presets.json"
-SETTINGS_FILE = EXT_DIR / "settings.json"
 LOCAL_TOKENIZER_DIR = EXT_DIR / "tokenizer"
 
 _RUN_LOCK = threading.Lock()
@@ -102,81 +99,47 @@ DEFAULT_PRESETS = {
 }
 
 
-_PRESET_LOCK = threading.RLock()
+# Presets live in Settings > Prompt Refiner as one text: each preset starts with a
+# "### Name" line followed by its instructions. A presets.json from an earlier
+# version only seeds the default text.
+PRESET_HEADER = "### "
 
 
-def load_presets():
-    """Read presets without overwriting malformed files; missing files use defaults."""
-    if not PRESETS_FILE.exists():
-        return dict(DEFAULT_PRESETS)
-    data = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or any(
-        not isinstance(name, str) or not name.strip() or not isinstance(text, str)
-        for name, text in data.items()
-    ):
-        raise ValueError("The presets file must contain an object mapping names to text.")
-    return data
+def presets_to_text(presets):
+    return "\n\n".join(f"{PRESET_HEADER}{name}\n{text.strip()}" for name, text in presets.items())
 
 
-def _replace_preset_file(path, content):
-    """Replace a file atomically using a temporary file on the same filesystem."""
-    temporary = None
+def presets_from_text(text):
+    """Parse "### Name" sections; text before the first header is ignored."""
+    presets, name, lines = {}, None, []
+    for line in (text or "").splitlines():
+        title = line[len(PRESET_HEADER):].strip() if line.startswith(PRESET_HEADER) else ""
+        if title:
+            if name is not None:
+                presets[name] = "\n".join(lines).strip()
+            name, lines = title, []
+        else:
+            lines.append(line)
+    if name is not None:
+        presets[name] = "\n".join(lines).strip()
+    return presets
+
+
+def _default_presets_text():
     try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        data = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data and all(
+            isinstance(name, str) and name.strip() and isinstance(text, str) for name, text in data.items()
+        ):
+            return presets_to_text(data)
+    except (OSError, ValueError):
+        pass
+    return presets_to_text(DEFAULT_PRESETS)
 
 
-def save_presets(data):
-    """Keep one previous version before atomically replacing the current presets."""
-    content = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
-    with _PRESET_LOCK:
-        if PRESETS_FILE.exists():
-            _replace_preset_file(PRESETS_FILE.with_suffix(".json.bak"), PRESETS_FILE.read_bytes())
-        _replace_preset_file(PRESETS_FILE, content)
-
-
-def select_preset_ui(name):
-    """Populate both editable fields from a user-selected preset without exceptions."""
-    try:
-        data = load_presets()
-        return data.get(name, ""), name or "", ""
-    except (OSError, ValueError) as exc:
-        message = f"Could not read presets: {exc}. Check presets.json before trying again."
-        print(f"[Prompt Refiner] {message}", flush=True)
-        return gr.update(), gr.update(), message
-
-
-def change_preset_ui(name, text=None, delete=False):
-    """Save or delete a preset, preserving the editor on validation or disk errors."""
-    name = (name or "").strip()
-    if not name:
-        message = "Select a preset to delete." if delete else "Enter a preset name before saving."
-        print(f"[Prompt Refiner] {message}", flush=True)
-        return gr.update(), gr.update(), gr.update(), message
-    try:
-        with _PRESET_LOCK:
-            data = load_presets()
-            existed = name in data
-            if delete:
-                if not existed:
-                    return gr.update(), gr.update(), gr.update(), "The selected preset no longer exists."
-                del data[name]
-            else:
-                data[name] = text or ""
-            save_presets(data)
-        selected = next(iter(data), None) if delete else name
-        message = f'Preset "{name}" deleted.' if delete else f'Preset "{name}" {"updated" if existed else "saved"}.'
-        print(f"[Prompt Refiner] {message}", flush=True)
-        return gr.update(choices=list(data), value=selected), data.get(selected, ""), selected or "", message
-    except (OSError, ValueError) as exc:
-        message = f"Could not {'delete' if delete else 'save'} the preset: {exc}. Your edits are still in the editor; check presets.json and folder write permissions."
-        print(f"[Prompt Refiner] {message}", flush=True)
-        return gr.update(), gr.update(), gr.update(), message
+def current_presets():
+    """Presets from Settings; a text without any "### Name" header falls back to the defaults."""
+    return presets_from_text(_opt("presets")) or dict(DEFAULT_PRESETS)
 
 
 # --------------------------------------------------------------------------------------
@@ -392,7 +355,7 @@ def _create_lm_head(repo_id, as_int8, token):
     save_file(tensors, str(out), metadata={"source": repo_id, "format": "int8-rowwise" if as_int8 else "dense"})
     mb = out.stat().st_size / 1e6
     names = list_lm_heads()
-    yield (_bar(1.0, f"Saved {out_name} ({mb:.0f} MB). It is selected below."),
+    yield (_bar(1.0, f"Saved {out_name} ({mb:.0f} MB). It is now the selected LM head in Settings > Prompt Refiner."),
            gr.update(choices=["Auto"] + names, value=out_name))
 
 
@@ -406,14 +369,20 @@ def _drain(gen, label):
         yield _bar(done / total, f"{label}: {done / 1e6:.0f} / {total / 1e6:.0f} MB"), gr.update()
 
 
-def create_lm_head_ui(repo_id, as_int8, token):
-    """Report setup, network, or file errors beside the download controls, without raising."""
+def create_lm_head_ui(repo_id, token):
+    """Report setup, network, or file errors beside the download controls, without raising.
+
+    A completed download becomes the selected LM head in Settings.
+    """
     try:
-        yield from _create_lm_head(repo_id, as_int8, token)
+        for bar, update in _create_lm_head(repo_id, _opt("lm_head_int8"), token):
+            if isinstance(update, dict) and update.get("value"):
+                _set_option("lm_head", update["value"])
+            yield bar
     except Exception as exc:
         message = f"LM head download not completed: {exc}"
         print(f"[Prompt Refiner] {message}", flush=True)
-        yield _bar(0, message), gr.update()
+        yield _bar(0, message)
 
 
 def build_model(path, dtype, rope_choice, work_device="cpu", keep_quantized=True, compress=False,
@@ -806,52 +775,176 @@ def run_refine(
 # UI: an accordion in txt2img and img2img
 # --------------------------------------------------------------------------------------
 
-# An empty idea field uses the tab's current prompt instead, without extra-network
-# tags such as <lora:name:1>, which the language model would rewrite or drop.
-FILL_IDEA_JS = r"""
+# The refiner reads and replaces the tab's own prompt. The prompt before the last
+# refinement is kept in the "original" field (the last event input) so it can be
+# restored. Refining an unedited result again starts over from that original, so
+# repeated clicks give new variations instead of refining a refinement; editing
+# the prompt makes the edited text the new original.
+# Per-tab browser state remembers the prompt text the refiner last wrote.
+_PROMPT_JS_STATE = r"""
+    const ta = gradioApp().querySelector('#TAB_prompt textarea');
+    const states = window.promptRefinerState = window.promptRefinerState || {};
+    const state = states['TAB'] = states['TAB'] || {};
+"""
+
+# Extra-network tags such as <lora:name:1> are not sent to the language model,
+# which would rewrite or drop them.
+READ_PROMPT_JS = r"""
 (...args) => {
-    if (!args[1] || !args[1].trim()) {
-        const ta = gradioApp().querySelector('#TAB_prompt textarea');
-        args[1] = (ta ? ta.value : '')
-            .replace(/<[^<>]+>/g, ' ')
-            .replace(/\s*,(\s*,)+/g, ',')
-            .replace(/\s+/g, ' ')
-            .replace(/^[\s,]+|[\s,]+$/g, '');
-    }
+""" + _PROMPT_JS_STATE + r"""
+    const current = ta ? ta.value : '';
+    const last = args.length - 1;
+    if (!(args[last] && current === state.applied)) { args[last] = current; }
+    args[1] = args[last]
+        .replace(/<[^<>]+>/g, ' ')
+        .replace(/\s*,(\s*,)+/g, ',')
+        .replace(/\s+/g, ' ')
+        .replace(/^[\s,]+|[\s,]+$/g, '');
     return args;
 }
 """
 
-# Replacing the prompt keeps its extra-network tags that the result does not already contain.
+# The original's tags come back where they were: leading tags before the result,
+# the others after it. Tags the result already contains are not repeated.
 APPLY_JS = r"""
-(text) => {
-    const ta = gradioApp().querySelector('#TAB_prompt textarea');
+(text, original) => {
+""" + _PROMPT_JS_STATE + r"""
     if (!ta || !text || !text.trim()) { return []; }
-    const tags = [...new Set(ta.value.match(/<[^<>]+>/g) || [])].filter((tag) => !text.includes(tag));
-    ta.value = [text.trim(), ...tags].join(' ');
+    const source = original || '';
+    const lead = ((source.match(/^(?:\s*<[^<>]+>[\s,]*)+/) || [''])[0].match(/<[^<>]+>/g)) || [];
+    const tags = [...new Set(source.match(/<[^<>]+>/g) || [])].filter((tag) => !text.includes(tag));
+    ta.value = [...tags.filter((tag) => lead.includes(tag)), text.trim(),
+                ...tags.filter((tag) => !lead.includes(tag))].join(' ');
     ta.dispatchEvent(new Event('input', {bubbles: true}));
+    state.applied = ta.value;
     return [];
 }
 """
 
-# txt2img and img2img build their own controls but share one settings store, so a
-# change saved from one tab is never reverted by a later change in the other.
-_SETTINGS = {"store": None}
+RESTORE_JS = r"""
+(original) => {
+""" + _PROMPT_JS_STATE + r"""
+    if (ta && original) {
+        ta.value = original;
+        ta.dispatchEvent(new Event('input', {bubbles: true}));
+        state.applied = undefined;
+    }
+    return [];
+}
+"""
+
+# --------------------------------------------------------------------------------------
+# Settings > Prompt Refiner: every option except the accordion's encoder and preset
+# menus, saved in Forge's config.json and read when Refine is clicked.
+# --------------------------------------------------------------------------------------
+
+OPTION_PREFIX = "prompt_refiner_"
+_CATEGORY = "prompt_refiner"
+_HIDDEN = (None, "Prompt Refiner")  # saved like any option, not listed in Settings
+DEVICE_CHOICES = ["auto (GPU if available)", "cuda", "cpu"]
+DTYPE_CHOICES = ["auto", "bfloat16", "float16", "float32"]
+ROPE_CHOICES = ["Auto (checkpoint configuration / model profile)", "1,000,000 (Qwen3)",
+                "5,000,000 (Qwen3-VL)", "10,000,000 (Qwen3.5)"]
 
 
-def _settings_for(controls):
-    if _SETTINGS["store"] is None:
-        choices = {
-            key: [choice[1] for choice in control.choices] + ([None] if control.value is None else [])
-            for key, control in controls.items() if isinstance(control, gr.Dropdown)
-        }
-        ranges = {
-            key: (control.minimum, control.maximum)
-            for key, control in controls.items() if isinstance(control, gr.Slider)
-        }
-        _SETTINGS["store"] = SettingsStore(SETTINGS_FILE, {key: control.value for key, control in controls.items()},
-                                           choices, ranges)
-    return _SETTINGS["store"]
+def _opt(key):
+    return getattr(shared.opts, OPTION_PREFIX + key)
+
+
+def _set_option(key, value):
+    """Remember an accordion choice; a failed save only loses that memory."""
+    try:
+        shared.opts.set(OPTION_PREFIX + key, value)
+        shared.opts.save(shared.config_filename)
+    except Exception as exc:
+        print(f"[Prompt Refiner] Could not save the {key} choice: {exc}", flush=True)
+
+
+def on_ui_settings():
+    categories.register_category(_CATEGORY, "Prompt Refiner")
+    presets_section = ("prompt_refiner_presets", "Presets")
+    sampling_section = ("prompt_refiner_sampling", "Sampling")
+    model_section = ("prompt_refiner_model", "Model")
+
+    def add(key, default, label, section, component=None, component_args=None, info=None, refresh=None):
+        option = shared.OptionInfo(default, label, component, component_args, refresh=refresh,
+                                   section=section, category_id=_CATEGORY)
+        shared.opts.add_option(OPTION_PREFIX + key, option.info(info) if info else option)
+
+    def slider(minimum, maximum, step):
+        return {"minimum": minimum, "maximum": maximum, "step": step}
+
+    add("encoder", "", "Text encoder", _HIDDEN)
+    add("preset", "", "System prompt preset", _HIDDEN)
+
+    add("presets", _default_presets_text(), "System prompt presets", presets_section, gr.Textbox, {"lines": 18},
+        info='each preset starts with a "### Name" line followed by its instructions; '
+             "after applying, click 🔄 in the accordion to update the preset menu")
+
+    defaults = SAMPLING_DEFAULTS
+    add("temperature", defaults["temperature"], "Temperature (0 = greedy)", sampling_section, gr.Slider, slider(0.0, 2.0, 0.05))
+    add("top_p", defaults["top_p"], "Top-p", sampling_section, gr.Slider, slider(0.0, 1.0, 0.01))
+    add("top_k", defaults["top_k"], "Top-k (0 = off)", sampling_section, gr.Slider, slider(0, 200, 1))
+    add("min_p", defaults["min_p"], "Min-p (0 = off)", sampling_section, gr.Slider, slider(0.0, 1.0, 0.01))
+    add("repetition_penalty", defaults["repetition_penalty"], "Repetition penalty", sampling_section, gr.Slider,
+        slider(1.0, 2.0, 0.01), info="above 1 penalizes tokens in both the input and generated text")
+    add("presence_penalty", defaults["presence_penalty"], "Presence penalty (0 = off)", sampling_section, gr.Slider,
+        slider(0.0, 2.0, 0.05), info="discourages reusing generated tokens; the idea and instructions are excluded")
+    add("seed", -1, "Seed (-1 = random)", sampling_section, gr.Number, {"precision": 0})
+    add("max_new_tokens", 768, "Max new tokens", sampling_section, gr.Slider, slider(32, 4096, 16),
+        info="generation stops earlier at the end of the answer; thinking models can need 2000+")
+    add("disable_thinking", True, "Disable thinking via chat template (switchable Qwen3 / Qwen3.5 only)", sampling_section,
+        info="dedicated Thinking-2507 checkpoints cannot disable thinking")
+
+    add("keep_loaded", False, "Keep the refiner model loaded between runs", model_section,
+        info="much faster repeated runs; keeps using VRAM while you generate images")
+    add("free_vram", True, "Unload Forge's image models from VRAM before loading the refiner model", model_section)
+    add("device", DEVICE_CHOICES[0], "Device", model_section, gr.Radio, {"choices": DEVICE_CHOICES})
+    add("dtype", DTYPE_CHOICES[0], "Compute dtype", model_section, gr.Radio, {"choices": DTYPE_CHOICES})
+    add("family", "Auto", "Model family", model_section, gr.Dropdown, {"choices": models.FAMILIES},
+        info="override Auto for renamed encoders with ambiguous architecture")
+    add("rope", ROPE_CHOICES[0], "RoPE theta", model_section, gr.Dropdown, {"choices": ROPE_CHOICES})
+    add("tokenizer_directory", "", "Tokenizer directory (optional)", model_section,
+        info="leave empty to use matching local Forge tokenizer files")
+    add("keep_quantized", True, "Keep supported quantized weights compressed (recommended)", model_section)
+    add("compress", False, "Also compress bf16 / fp16 weights to int8 on load", model_section,
+        info="reduces weight memory; may affect quality")
+    add("lm_head", "Auto", "LM head file", model_section, gr.Dropdown,
+        lambda: {"choices": ["Auto"] + list_lm_heads()}, refresh=list_lm_heads,
+        info="for untied encoders without output weights; download one from the accordion")
+    add("lm_head_int8", True, "Store downloaded LM heads as int8 (half the size)", model_section)
+
+
+script_callbacks.on_ui_settings(on_ui_settings)
+
+
+def _run(encoder_name, idea, preset_name, source):
+    """Refine with the options applied in Settings at click time, then report the
+    text to apply: empty unless a complete, unstopped result was generated."""
+    lm_head = _opt("lm_head")
+    if lm_head != "Auto" and lm_head not in list_lm_heads():
+        lm_head = "Auto"
+    refine_args = (
+        encoder_name, idea, current_presets().get(preset_name, ""),
+        _opt("temperature"), _opt("top_p"), _opt("top_k"), _opt("min_p"), _opt("repetition_penalty"),
+        _opt("max_new_tokens"), _opt("seed"), _opt("device"), _opt("dtype"), _opt("rope"),
+        _opt("keep_loaded"), _opt("free_vram"), _opt("disable_thinking"), _opt("keep_quantized"), _opt("compress"),
+        lm_head, _opt("family"), _opt("tokenizer_directory") or "", _opt("presence_penalty"),
+    )
+    text = summary = ""
+    first = True
+    for result, message, progress in run_refine(*refine_args):
+        if isinstance(result, str):
+            text = result
+        # Keep routine status short and put model diagnostics in their own panel.
+        summary, _, details = message.partition("\n")
+        yield text, summary, progress, details, (source if first else gr.update()), ""
+        first = False
+    keep = gr.update()
+    if _STOP.is_set():
+        yield keep, f"{summary} The prompt was left unchanged.", keep, keep, keep, ""
+    elif text and summary.startswith("Done"):
+        yield keep, f"{summary} The prompt was replaced; Restore original brings it back.", keep, keep, keep, text
 
 
 def _blocks(block):
@@ -862,207 +955,90 @@ def _blocks(block):
 
 def build_ui(tab):
     """Build the refiner inside an accordion of the txt2img or img2img tab."""
-    preset_message = ""
-    try:
-        presets = load_presets()
-    except (OSError, ValueError) as exc:
-        presets = dict(DEFAULT_PRESETS)
-        preset_message = f"Could not read presets.json: {exc}. The file was left unchanged; repair it or restore presets.json.bak before saving."
-        print(f"[Prompt Refiner] {preset_message}", flush=True)
-    preset_names = list(presets.keys())
     encoders = list_encoders()
+    presets = list(current_presets())
+    saved_encoder, saved_preset = _opt("encoder"), _opt("preset")
 
     with gr.Accordion("Prompt Refiner", open=False, elem_id=f"prompt_refiner_{tab}_accordion") as accordion:
         with gr.Row():
             encoder = gr.Dropdown(
-                label="Text encoder (models/text_encoder)", choices=encoders,
-                value=encoders[0] if encoders else None, scale=10,
+                label="Text encoder (models/text_encoder)", choices=encoders, scale=6,
+                value=saved_encoder if saved_encoder in encoders else (encoders[0] if encoders else None),
+            )
+            preset = gr.Dropdown(
+                label="System prompt preset", choices=presets, scale=4,
+                value=saved_preset if saved_preset in presets else (presets[0] if presets else None),
             )
             refresh_btn = gr.Button("🔄", elem_classes=["tool"], scale=1, min_width=40)
         with gr.Row():
-            with gr.Column(scale=1):
-                prompt = gr.Textbox(
-                    label="Idea", lines=4,
-                    placeholder="Leave empty to refine this tab's current prompt (<lora:...> tags are kept out and restored)",
-                )
-                with gr.Row():
-                    run_btn = gr.Button("Refine prompt", variant="primary", scale=4)
-                    stop_btn = gr.Button("Stop", scale=1)
-            with gr.Column(scale=1):
-                output = gr.Textbox(label="Result", lines=6, interactive=True, show_copy_button=True)
-                with gr.Row():
-                    apply_btn = gr.Button("Apply to prompt", variant="primary")
-                    reuse_btn = gr.Button("Use result as idea")
-        with gr.Row():
-            preset = gr.Dropdown(label="System prompt preset", choices=preset_names,
-                                 value=preset_names[0] if preset_names else None, scale=3)
-            max_new = gr.Slider(32, 4096, value=768, step=16, label="Max new tokens", scale=2)
-            empty_think = gr.Checkbox(value=True, label="Disable thinking (switchable Qwen3 / Qwen3.5 only)",
-                                      info="Dedicated Thinking-2507 checkpoints cannot disable thinking.", scale=2)
+            run_btn = gr.Button("Refine prompt", variant="primary", scale=4)
+            stop_btn = gr.Button("Stop", scale=1)
+            restore_btn = gr.Button("Restore original", scale=2)
+        output = gr.Textbox(label="Refined prompt (live)", lines=3, interactive=False, show_copy_button=True)
+        original = gr.Textbox(
+            label="Original prompt (before the last refinement)", lines=2, interactive=False,
+            show_copy_button=True, placeholder="Refine prompt replaces this tab's prompt; the previous one is kept here.",
+        )
         progress_html = gr.HTML(value="")
         status = gr.Textbox(label="Status", interactive=False, lines=1)
 
-        with gr.Accordion("System prompt & presets", open=False):
-            system_prompt = gr.Textbox(label="System prompt (instructions for the LLM)", lines=9,
-                                       value=presets[preset_names[0]] if preset_names else "")
-            with gr.Row():
-                preset_name = gr.Textbox(label="Preset name", scale=3, placeholder="Name for a new preset",
-                                         value=preset_names[0] if preset_names else "",
-                                         info="Keep this name to update the preset, or change it to save a copy.")
-                save_btn = gr.Button("Save preset", scale=1)
-                delete_btn = gr.Button("Delete selected preset", scale=1)
-            preset_status = gr.Textbox(label="Preset status", value=preset_message, interactive=False, lines=2)
+        with gr.Accordion("Model details", open=False):
+            model_details = gr.Textbox(label="Loaded model details", interactive=False, lines=5)
+            unload_btn = gr.Button("Unload model")
 
-        with gr.Accordion("Sampling options", open=False):
+        with gr.Accordion("Download a missing LM head", open=False):
             gr.Markdown(
-                "Defaults follow the **Qwen3-VL 4B Instruct VL profile**, including presence penalty **1.5** to discourage repetition. "
-                "Use the natural-language system preset to preserve the idea's explicit details."
-            )
-            with gr.Row():
-                temperature = gr.Slider(0.0, 2.0, value=SAMPLING_DEFAULTS["temperature"], step=0.05, label="Temperature (0 = greedy)")
-                top_p = gr.Slider(0.0, 1.0, value=SAMPLING_DEFAULTS["top_p"], step=0.01, label="Top-p")
-                top_k = gr.Slider(0, 200, value=SAMPLING_DEFAULTS["top_k"], step=1, label="Top-k (0 = off)")
-                min_p = gr.Slider(0.0, 1.0, value=SAMPLING_DEFAULTS["min_p"], step=0.01, label="Min-p (0 = off)")
-            with gr.Row():
-                rep_penalty = gr.Slider(1.0, 2.0, value=SAMPLING_DEFAULTS["repetition_penalty"], step=0.01, label="Repetition penalty",
-                                        info="Above 1 penalizes tokens in both the input and generated text.")
-                presence = gr.Slider(0.0, 2.0, value=SAMPLING_DEFAULTS["presence_penalty"], step=0.05, label="Presence penalty (0 = off)",
-                                     info="Discourages reusing generated tokens. The input idea and system instructions are excluded.")
-                seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
-            sampling_reset = gr.Button("Use Qwen3-VL defaults", size="sm")
-
-        with gr.Accordion("Advanced model settings", open=False):
-            with gr.Row():
-                family = gr.Dropdown(models.FAMILIES, value="Auto", label="Model family",
-                                     info="Override Auto for renamed encoders with ambiguous architecture.", scale=1)
-                tokenizer_override = gr.Textbox(label="Tokenizer directory (optional)", scale=3,
-                                                placeholder="Leave empty to use matching local Forge tokenizer files")
-            with gr.Row():
-                device = gr.Dropdown(["auto (GPU if available)", "cuda", "cpu"], value="auto (GPU if available)", label="Device")
-                dtype = gr.Dropdown(["auto", "bfloat16", "float16", "float32"], value="auto", label="Compute dtype")
-                rope = gr.Dropdown(["Auto (checkpoint configuration / model profile)", "1,000,000 (Qwen3)", "5,000,000 (Qwen3-VL)", "10,000,000 (Qwen3.5)"],
-                                   value="Auto (checkpoint configuration / model profile)", label="RoPE theta")
-            with gr.Row():
-                keep_loaded = gr.Checkbox(value=False, label="Keep model loaded after generation (uses VRAM!)")
-                free_vram = gr.Checkbox(value=True, label="Unload Forge's image models from VRAM before loading the LLM")
-            with gr.Row():
-                keep_q = gr.Checkbox(value=True, label="Keep supported quantized weights compressed (recommended)")
-                compress = gr.Checkbox(value=False, label="Also compress bf16 / fp16 weights to int8 on load (reduces weight memory; may affect quality)")
-
-        with gr.Accordion("LM head (for untied encoders with missing output weights)", open=False):
-            gr.Markdown(
-                "Known tied models need no extra weights. Qwen2.5-VL 7B, Qwen3.5 9B, and untied Qwen3/VL encoders need the exact "
-                "`lm_head.weight` tensor from the original model on Hugging Face; it is stored once in "
-                "`models/prompt_refiner/lm_heads/`. Select it explicitly unless its name matches the encoder stem or source metadata matches. "
-                "Matching tensor dimensions alone do not establish compatibility."
-            )
-            with gr.Row():
-                lm_choice = gr.Dropdown(label="LM head file", choices=["Auto"] + list_lm_heads(), value="Auto", scale=4)
-                lm_refresh = gr.Button("🔄", elem_classes=["tool"], scale=1, min_width=40)
-            gr.Markdown(
-                "If refinement reports a missing output head: choose the standard original model below, "
-                "click **Download lm_head**, then refine again with the downloaded file selected. "
-                "For MOSS-Image / Qwen3.5 9B, the standard source is **Qwen/Qwen3.5-9B**. "
-                "Enter a repository ID as `owner/model` (for example, `Qwen/Qwen3.5-9B`), "
-                "not a web page URL or a diffusion model repository. For custom/fine-tuned encoders, "
-                "enter the exact original checkpoint repository. Suggestions do not establish compatibility."
+                "Known tied models need no extra weights. Qwen2.5-VL 7B, Qwen3.5 9B, and untied Qwen3/VL encoders "
+                "without `lm_head.weight` need that exact tensor from the ORIGINAL model on Hugging Face "
+                "(for MOSS-Image / Qwen3.5 9B: `Qwen/Qwen3.5-9B`). Enter it as `owner/model`; for fine-tunes, use "
+                "their exact original checkpoint. The download is stored in `models/prompt_refiner/lm_heads/` and "
+                "selected in **Settings > Prompt Refiner**. Matching tensor dimensions do not establish compatibility."
             )
             lm_source = gr.Dropdown(label="Known original model source", choices=list(KNOWN_HEAD_SOURCES),
                                     value=next(iter(KNOWN_HEAD_SOURCES)))
             with gr.Row():
                 lm_repo = gr.Textbox(label="Hugging Face repo of the ORIGINAL model", placeholder="Qwen/Qwen3.5-9B", scale=4)
                 lm_token = gr.Textbox(label="HF token (only for gated repos)", type="password", scale=2)
-            with gr.Row():
-                lm_int8 = gr.Checkbox(value=True, label="Store as int8 (half the size)")
-                lm_btn = gr.Button("Download lm_head")
+                lm_btn = gr.Button("Download lm_head", scale=1)
             lm_status = gr.HTML(value="")
 
-        with gr.Accordion("Model details", open=False):
-            model_details = gr.Textbox(label="Loaded model details", interactive=False, lines=5)
-            unload_btn = gr.Button("Unload model")
+        gr.Markdown("Sampling, model, and preset options: **Settings > Prompt Refiner**. They apply on the next refinement.")
+        # Filled by READ_PROMPT_JS and by the generator; never shown. Only a
+        # completed, unstopped result reaches apply_text and the prompt.
+        prompt = gr.Textbox(visible=False)
+        apply_text = gr.Textbox(visible=False)
 
-        # Persist only explicitly listed controls. Prompt/result text, unsaved
-        # instructions, preset-name drafts, download tokens, and status are excluded.
-        controls = {
-            "encoder": encoder, "preset": preset, "max_new_tokens": max_new,
-            "disable_thinking": empty_think, "temperature": temperature,
-            "top_p": top_p, "top_k": top_k, "min_p": min_p,
-            "repetition_penalty": rep_penalty, "presence_penalty": presence, "seed": seed,
-            "family": family, "tokenizer_directory": tokenizer_override,
-            "device": device, "dtype": dtype, "rope": rope,
-            "keep_loaded": keep_loaded, "free_vram": free_vram,
-            "keep_quantized": keep_q, "compress": compress,
-            "lm_head": lm_choice, "lm_head_int8": lm_int8, "lm_head_repo": lm_repo,
-        }
-        settings = _settings_for(controls)
-        for key, control in controls.items():
-            control.value = settings.values[key]
-        system_prompt.value = presets.get(preset.value, "")
-        preset_name.value = preset.value or ""
-        lm_source.value = next((name for name, repo in KNOWN_HEAD_SOURCES.items() if repo == lm_repo.value), next(iter(KNOWN_HEAD_SOURCES)))
-        settings_status = gr.Textbox(label="Settings status", value=settings.message,
-                                     visible=bool(settings.message), interactive=False)
+    encoder.change(lambda name: _set_option("encoder", name or ""), inputs=[encoder], outputs=None, show_progress="hidden")
+    preset.change(lambda name: _set_option("preset", name or ""), inputs=[preset], outputs=None, show_progress="hidden")
 
-    def _remember(key):
-        """Bind a single control to avoid overwriting other concurrent changes."""
-        def changed(value):
-            message = settings.update(key, value)
-            return gr.update(value=message, visible=bool(message))
-        return changed
+    def _refresh(current_encoder, current_preset):
+        names, preset_names = list_encoders(), list(current_presets())
+        return (
+            gr.update(choices=names, value=current_encoder if current_encoder in names else (names[0] if names else None)),
+            gr.update(choices=preset_names,
+                      value=current_preset if current_preset in preset_names else (preset_names[0] if preset_names else None)),
+        )
 
-    for key, control in controls.items():
-        control.change(_remember(key), inputs=[control], outputs=[settings_status], show_progress="hidden")
-
-    # ---- events ----
-    sampling_reset.click(
-        lambda: tuple(SAMPLING_DEFAULTS.values()),
-        inputs=[], outputs=[controls[key] for key in SAMPLING_DEFAULTS],
-        show_progress="hidden",
-    )
-
-    def _refresh(current):
-        names = list_encoders()
-        return gr.update(choices=names, value=current if current in names else (names[0] if names else None))
-
-    refresh_btn.click(_refresh, inputs=[encoder], outputs=[encoder])
-    lm_refresh.click(lambda cur: gr.update(choices=["Auto"] + list_lm_heads(), value=cur),
-                     inputs=[lm_choice], outputs=[lm_choice])
+    refresh_btn.click(_refresh, inputs=[encoder, preset], outputs=[encoder, preset])
     lm_source.input(lambda name: KNOWN_HEAD_SOURCES.get(name, ""), inputs=[lm_source], outputs=[lm_repo])
     lm_repo.input(lambda repo: next((name for name, value in KNOWN_HEAD_SOURCES.items() if value == repo), next(iter(KNOWN_HEAD_SOURCES))),
                   inputs=[lm_repo], outputs=[lm_source])
-    lm_btn.click(create_lm_head_ui, inputs=[lm_repo, lm_int8, lm_token], outputs=[lm_status, lm_choice],
-                 show_progress="hidden")
-
-    # Only user selection reloads the editor; programmatic dropdown updates
-    # must not clear the success/error message from a save or deletion.
-    preset.input(select_preset_ui, inputs=[preset], outputs=[system_prompt, preset_name, preset_status])
-    save_btn.click(change_preset_ui, inputs=[preset_name, system_prompt],
-                   outputs=[preset, system_prompt, preset_name, preset_status])
-    delete_btn.click(lambda name: change_preset_ui(name, delete=True), inputs=[preset],
-                     outputs=[preset, system_prompt, preset_name, preset_status])
-
-    def _run_with_details(*args):
-        """Keep routine status short and put model diagnostics in their own panel."""
-        for result, message, progress in run_refine(*args):
-            summary, _, details = message.partition("\n")
-            yield result, summary, progress, details
+    lm_btn.click(create_lm_head_ui, inputs=[lm_repo, lm_token], outputs=[lm_status], show_progress="hidden")
 
     run_btn.click(
-        _run_with_details,
-        inputs=[encoder, prompt, system_prompt, temperature, top_p, top_k, min_p, rep_penalty,
-                max_new, seed, device, dtype, rope, keep_loaded, free_vram, empty_think, keep_q, compress, lm_choice, family, tokenizer_override, presence],
-        outputs=[output, status, progress_html, model_details],
+        _run,
+        inputs=[encoder, prompt, preset, original],
+        outputs=[output, status, progress_html, model_details, original, apply_text],
         show_progress="hidden",
-        js=FILL_IDEA_JS.replace("TAB", tab),
-    )
+        js=READ_PROMPT_JS.replace("TAB", tab),
+    ).success(fn=None, inputs=[apply_text, original], outputs=None, js=APPLY_JS.replace("TAB", tab))
     stop_btn.click(lambda: _STOP.set(), inputs=None, outputs=None)
-    reuse_btn.click(lambda t: t, inputs=[output], outputs=[prompt])
+    restore_btn.click(fn=None, inputs=[original], outputs=None, js=RESTORE_JS.replace("TAB", tab))
     unload_btn.click(lambda: (unload_model(), ""), outputs=[status, model_details])
-    apply_btn.click(fn=None, inputs=[output], outputs=None, js=APPLY_JS.replace("TAB", tab))
 
-    # Forge applies ui-config.json after the tab is built. Its older defaults must
-    # not overwrite settings.json or restore text/secrets that this extension
-    # deliberately excludes from persistence, so every control opts out.
+    # Forge applies ui-config.json after the tab is built. The encoder and preset
+    # menus are remembered in Forge's settings instead, and transient text must
+    # not be restored, so every control in the accordion opts out.
     for component in _blocks(accordion):
         component.do_not_save_to_config = True
     return accordion

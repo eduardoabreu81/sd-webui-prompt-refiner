@@ -103,51 +103,52 @@ Qwen3.5 uses the extension's local decoder with Forge's Transformers 4.x package
 
 ## Controls, settings, and presets
 
-The refiner is an accordion in txt2img and img2img. The idea and result are side
-by side, with refinement controls below the idea and **Apply to prompt** below the
-result. An empty idea uses the tab's current prompt with extra-network tags
-(`<...>`) removed; applying the result keeps the current prompt's tags that the
-result does not already contain. Preset selection, **Max new tokens**, and
-**Disable thinking** are below them; disabling thinking is checked by default for
-switchable Qwen3 models. Both tabs share one loaded model and one `settings.json`;
-a change saved in one tab is shown in the other after Forge restarts. Expand **System prompt
-& presets** to edit instructions or manage presets. **Sampling options** and
-**Advanced model settings** are collapsed by default. The short status appears
-below the result; expand **Model details** for tokenizer, quantization, device,
-and memory diagnostics or to unload the model manually.
+The refiner is an accordion in txt2img and img2img with the encoder and preset
+menus, **Refine prompt**, **Stop**, and **Restore original**. Refinement reads the
+tab's prompt, removes extra-network tags (`<...>`), and streams the result into
+**Refined prompt (live)**. A completed result replaces the tab's prompt; stopped,
+failed, or empty runs leave the prompt unchanged. The original tags are put back:
+tags that led the original prompt stay first, the others follow the result, and
+tags the result already contains are not repeated.
 
-Selections and options are saved automatically on change to `settings.json` in
-the extension folder and restored after a page reload or Forge restart. These
-controls opt out of Forge's separate `ui-config.json` defaults so they cannot
-overwrite the extension's saved choices or restore excluded text fields. This
-includes the encoder, selected system prompt preset, checkboxes, sampling/model
-options, tokenizer directory, and LM head choices. A missing model, preset, or
-head falls back to the available default. Invalid saved values use defaults;
-settings read/write failures produce a nonfatal message in **Settings status**.
-Your prompt/idea, generated result, unsaved system prompt edits, preset-name draft,
-and Hugging Face token are never saved in this file. System instructions are
-saved only through **Save preset**. Delete `settings.json` while Forge is stopped
-to reset preferences.
+**Original prompt** keeps the prompt from before the last refinement, and
+**Restore original** writes it back. Clicking **Refine prompt** again while the
+prompt is still the unedited result starts over from that original, which gives
+another variation instead of refining a refinement; any edit to the prompt makes
+the edited text the new original. This state lives in the open page and is not
+saved. Both tabs share one loaded model. The short status appears below the
+result; expand **Model details** for tokenizer, quantization, device, and memory
+diagnostics or to unload the model manually.
 
-The model is unloaded after each run by default. **Keep model loaded** avoids
-reloading at the cost of occupied memory. **Unload model** releases it manually.
-After a loading or generation error, the refiner always unloads, including when
-**Keep model loaded** is enabled. It stops and joins any active generation worker,
-releases input/model references, and clears failed traceback frames before garbage
-collection and returning unused CUDA cache. Other Forge models and GPU programs
-can still occupy VRAM; this releases the failed refiner run's allocations.
-Loading from disk is reported whenever needed; retaining a model only avoids
-reloading when the selected encoder and model settings still match.
-Presets are editable in the UI and saved in `presets.json`. Selecting a preset
-fills both its instructions and name. **Save preset** updates that name; change
-the name to save a copy. **Delete selected preset** removes the selected entry,
-including the last entry if desired. Validation and file errors appear in
-**Preset status** without a console traceback, and failed saves preserve the editor.
-Before each save or deletion, an existing `presets.json` is copied to
-`presets.json.bak`, replacing the previous backup. To undo the last saved change,
-stop Forge, copy `presets.json.bak` over `presets.json`, and restart Forge. This is
-one previous version, not a backup history. Malformed files are never silently
-replaced with defaults. Both files are inside the extension folder.
+All other options are in **Settings > Prompt Refiner**, stored in Forge's
+`config.json` as `prompt_refiner_*` entries and read when **Refine prompt** is
+clicked, so applied changes take effect on the next refinement:
+
+- **Presets**: one text in which each preset starts with a `### Name` line,
+  followed by its instructions. Text before the first header is ignored, and a
+  text without any header falls back to the built-in presets. After applying,
+  click 🔄 in the accordion to update the preset menu. A `presets.json` from an
+  earlier version of the extension seeds the default text.
+- **Sampling**: temperature, top-p, top-k, min-p, repetition and presence
+  penalties, seed, **Max new tokens**, and **Disable thinking via chat template**
+  (checked by default for switchable Qwen3 / Qwen3.5 models).
+- **Model**: keep-loaded and VRAM behavior, device, compute dtype, model family,
+  RoPE, tokenizer directory, compression options, and the LM head file.
+
+The encoder and preset menus are remembered in the same `config.json` when
+changed. The accordion's controls opt out of Forge's `ui-config.json` defaults, so
+older saved values cannot override them or restore transient text. Prompts,
+results, and the Hugging Face token are never saved by the extension.
+
+The model is unloaded after each run by default. **Keep the refiner model loaded
+between runs** avoids reloading at the cost of occupied memory. **Unload model**
+releases it manually. After a loading or generation error, the refiner always
+unloads, including when keep-loaded is enabled. It stops and joins any active
+generation worker, releases input/model references, and clears failed traceback
+frames before garbage collection and returning unused CUDA cache. Other Forge
+models and GPU programs can still occupy VRAM; this releases the failed refiner
+run's allocations. Loading from disk is reported whenever needed; retaining a
+model only avoids reloading when the selected encoder and model settings still match.
 An empty prompt or missing encoder produces a status message without loading a
 model or raising an exception. The console logs skipped requests, the start of
 refinement, completion/stopping, and failures; prompt text is not logged.
@@ -155,9 +156,8 @@ refinement, completion/stopping, and failures; prompt text is not logged.
 ### Sampling and presence penalty
 
 See the [README sampling table](../README.md#sampling-recommendations) for profiles.
-New installations use the Qwen3-VL 4B Instruct VL model-card values, including
-presence penalty 1.5, with min-p disabled. Existing settings are preserved; the reset
-button changes only the six sampling controls, whose change handlers persist them.
+The defaults in **Settings > Prompt Refiner > Sampling** are the Qwen3-VL 4B
+Instruct VL model-card values, including presence penalty 1.5, with min-p disabled.
 Model selection does not import a generation config or apply another profile.
 
 The presence control is implemented as an additive Transformers logits processor
@@ -172,9 +172,8 @@ This is a token-level penalty, not a detector for repeated phrases or concepts.
 The generation request explicitly overrides temperature, top-p, top-k, min-p,
 and repetition penalty. Disabled filters cannot be restored from model defaults.
 At temperature zero, top-p/top-k/min-p are ignored; repetition and presence
-penalties remain active. Presence penalty is saved in `settings.json` like the
-other sampling controls and defaults to 1.5 when older settings omit it. Explicitly
-saved values, including zero, are preserved.
+penalties remain active. Presence penalty is saved in Forge's settings like the
+other sampling options; explicitly saved values, including zero, are preserved.
 
 ## Qwen3.5 9B / MOSS-Image
 
@@ -218,7 +217,7 @@ recognized. Community exports may include an output head, but this is not assume
 
 If `lm_head.weight` is present, it is used directly. If it is absent, obtain the
 head from the exact original checkpoint (for standard weights, `Qwen/Qwen3.5-9B`)
-using the existing **LM head** controls. A head from another fine-tune is not
+using **Download a missing LM head** in the accordion. A head from another fine-tune is not
 interchangeable merely because it has the same dimensions.
 
 A 9B INT8 encoder also needs memory for dense embeddings, its output head, and
@@ -245,7 +244,7 @@ original HF config beside it as `<encoder-stem>.config.json`; a neighboring
 The config must match the tensors and specify `tie_word_embeddings` for unknown
 profiles. An unknown signature is treated as a setup issue: **Status** and a short
 console line show the required config, without a traceback. The existing result
-is preserved, and model resources are released even with **Keep model loaded** enabled.
+is preserved, and model resources are released even with keep-loaded enabled.
 Non-default RoPE scaling, sliding-window attention, and unsupported hybrid layouts
 are rejected rather than silently ignored. Qwen3.5 uses its own validated hybrid path.
 
@@ -363,7 +362,7 @@ Validation covers small full causal models for W6A8, INT4 ConvRot and NVFP4,
 CPU/GPU linear paths, and Qwen3.5 GGUF logits/cached generation with both split
 and merged projections in FP32/BF16/FP16 on CPU and CUDA. Error-handling tests
 check that failed loading and generation release model/temporary tensors before
-emptying CUDA cache, including chained exceptions and **Keep model loaded**.
+emptying CUDA cache, including chained exceptions and with keep-loaded enabled.
 An actual MiniMax-H3 INT4 ConvRot K projection was also
 loaded and executed on CPU and RTX 4060. Full generation also passed with the
 real `qwen3_vl_4b_nvfp4_full.safetensors` encoder on RTX 4060, using per-layer
@@ -413,8 +412,8 @@ output head. A model's hidden size alone is never used to infer weight tying.
 
 A missing output head is an expected setup condition: refinement stops with a
 message in **Status** and a short console line, without a traceback or clearing
-the existing result. Open **LM head**, choose a **Known original model source**,
-and click **Download lm_head**. The source choice fills the repository field;
+the existing prompt. Open **Download a missing LM head** in the accordion, choose a
+**Known original model source**, and click **Download lm_head**. The source choice fills the repository field;
 custom repositories can still be entered manually as `owner/model`, not a web URL.
 These suggestions apply to standard original checkpoints:
 
@@ -437,6 +436,7 @@ then stored in `models/prompt_refiner/lm_heads/`, as row-wise INT8 by default.
 The token field is only needed for gated repositories. This is an explicit optional
 weight download; inference itself stays local.
 
+A completed download becomes the **LM head file** selected in Settings.
 Choose the head explicitly. **Auto** uses an exact filename matching
 `<encoder-stem>.safetensors`, or identical original-source metadata when available.
 It no longer chooses a head merely because tensor dimensions match. Explicit
@@ -452,9 +452,10 @@ cache on the next refinement.
 
 1. Stop Forge Neo.
 2. Delete the extension folder, normally
-   `<forge>/extensions/sd-webui-prompt-refiner/`. This also removes saved presets
-   (`presets.json`, `presets.json.bak`, and `settings.json`) and any tokenizers stored in its `tokenizer/<family>/` folders.
-   Back up these files first if you want to keep them.
+   `<forge>/extensions/sd-webui-prompt-refiner/`. This also removes any tokenizers
+   stored in its `tokenizer/<family>/` folders. Options and presets remain in
+   Forge's `config.json` as unused `prompt_refiner_*` entries; copy your presets
+   text from Settings first if you want to keep it.
 3. Delete downloaded output heads from
    `<forge>/models/prompt_refiner/lm_heads/`. These files are stored outside the
    extension and are not removed when its folder is deleted. You can remove

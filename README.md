@@ -6,7 +6,8 @@ img2img and runs locally inside Forge, without LM Studio, Ollama, or a separate
 language-model server.
 
 This is a fork of [AMGarkin/sd-webui-prompt-refiner](https://github.com/AMGarkin/sd-webui-prompt-refiner)
-that moves the refiner from its own tab into the generation tabs.
+that moves the refiner from its own tab into the generation tabs, refines the
+tab's prompt in place, and keeps its options in Forge's Settings.
 
 ## Install
 
@@ -22,23 +23,40 @@ packages; it does not install or upgrade them.
 1. Place a supported `.safetensors` or `.gguf` text encoder in
    `<forge>/models/text_encoder/`. Subfolders, `models/text_encoders/`, and Forge's
    extra text encoder directory are also searched. Refresh the list after adding files.
-2. In txt2img or img2img, open the **Prompt Refiner** accordion and select the encoder.
-   Leave **Model family** on **Auto** and the tokenizer directory empty unless setup
-   requires an override.
-3. Enter your idea, or leave **Idea** empty to refine the tab's current prompt.
-   Choose a system prompt preset and click **Refine prompt**.
-4. Review the result, then click **Apply to prompt** to replace the tab's prompt.
-   Extra-network tags such as `<lora:name:1>` are not sent to the language model;
-   tags from the current prompt are kept and added after the result.
-   **Use result as idea** lets you refine it again.
+2. Write your idea in the txt2img or img2img prompt as usual.
+3. Open the **Prompt Refiner** accordion, select the encoder and a system prompt
+   preset, and click **Refine prompt**. The refined text appears live, then
+   replaces the tab's prompt.
+4. Not good? Click **Refine prompt** again for a new variation of the same original,
+   or **Restore original** to put your prompt back. The original stays visible in
+   the accordion. Editing the prompt makes the edited text the new original.
 
-Expand **System prompt & presets** to edit instructions. **Save preset** updates
-an existing name; change the name to save a copy. Presets can also be deleted,
-and one backup of the previous version is kept.
+Extra-network tags such as `<lora:name:1>` are not sent to the language model.
+They are put back in the refined prompt: tags at the start of your prompt stay at
+the start, the others are added at the end.
 
-Your model, preset selection, and options are remembered after restarting Forge.
-Your idea and generated result are not saved. **Disable thinking via chat template**
-is checked by default; dedicated thinking-only models cannot reliably disable reasoning.
+All other options are in **Settings > Prompt Refiner**: system prompt presets,
+sampling, and model settings. Applied changes take effect on the next refinement.
+Presets are one text in which each preset starts with a `### Name` line; after
+applying, click 🔄 in the accordion to update the preset menu. The encoder and
+preset choices are remembered with Forge's settings. Your prompts and results are
+not saved by the extension. **Disable thinking via chat template** is checked by
+default; dedicated thinking-only models cannot reliably disable reasoning.
+
+## Choosing an encoder for speed
+
+The refiner only writes text, so **it does not need the same encoder as your
+image model**: a Qwen3-VL 4B encoder can write prompts for MOSS-Image, Anima, or
+any other model. For speed, prefer **Qwen3-VL 4B** or **Qwen3 4B** stored as
+**INT8 / INT8 ConvRot or scaled FP8** on an NVIDIA GPU, and enable **Keep the
+refiner model loaded between runs** in Settings if you have spare VRAM.
+
+Avoid larger or slower paths unless you need them: **Qwen3.5 9B** runs on the
+extension's own PyTorch decoder, **W4A8/W6A8** and **GGUF** can decompress every
+layer for each token when no fast kernel applies, and an encoder that does not fit
+in VRAM spills into shared system memory on Windows. Any of these can drop output
+to seconds or even minutes per token. Without an NVIDIA GPU, refinement runs on
+the CPU. **Model details** shows the device, execution path, and memory use.
 
 ## Supported encoders
 
@@ -98,10 +116,9 @@ penalties still apply. Keep **Seed -1** for variation, or use a fixed seed when
 comparing settings. **Disable thinking** remains checked by default. Thinking
 profiles need that checkbox cleared and may need a higher **Max new tokens** limit.
 
-Existing saved values remain in effect. Open **Sampling options** and click
-**Use Qwen3-VL defaults** to apply and save the six default sampling values; this
-keeps your seed and other options. Profiles are set manually: selecting an encoder
-does not replace your choices or automatically import a `generation_config.json`.
+Sampling values are set in **Settings > Prompt Refiner > Sampling**; the table's
+first row is the default. Profiles are set manually: selecting an encoder does not
+replace your choices or automatically import a `generation_config.json`.
 
 ## What to expect
 
@@ -109,18 +126,19 @@ does not replace your choices or automatically import a `generation_config.json`
   rewriting better than base models. Review the result before generating an image;
   the encoder can add details or change the meaning of your idea.
 - **Some encoders need an output head.** If Forge's encoder omits the weights needed
-  to generate text, the status message explains what is missing. Expand **LM head**,
-  select a known original model source, and download its matching head. This optional
+  to generate text, the status message explains what is missing. Expand **Download a
+  missing LM head** in the accordion, select a known original model source, and
+  download its matching head; it becomes the LM head selected in Settings. This optional
   download is stored locally; do not substitute a head from a different model.
 - **Speed and memory depend on your hardware and model.** The GPU path targets
   NVIDIA CUDA across different VRAM capacities. Choose an encoder that fits with
   room for inference; a small file does not guarantee low memory use or faster output.
   Quantization can reduce memory, but fast kernels vary by GPU and installed backend.
   CPU inference is available. AMD/ROCm is untested.
-- **Models unload after refinement by default.** Enable **Keep model loaded** for
-  repeated use if you have enough memory. **Model details** shows diagnostics and
+- **Models unload after refinement by default.** Enable **Keep the refiner model
+  loaded between runs** in Settings for repeated use if you have enough memory. **Model details** shows diagnostics and
   provides a manual unload button. Failed runs always release the refiner's model
-  and temporary tensors, even with **Keep model loaded** enabled.
+  and temporary tensors, even when the model is kept loaded.
   Increase **Max new tokens** if output is cut short.
 
 For tokenizer overrides, missing heads, memory troubleshooting, or choosing a
@@ -131,8 +149,9 @@ without a traceback; supply the matching original HF config as described there.
 ## Uninstall
 
 1. Stop Forge Neo and delete `<forge>/extensions/sd-webui-prompt-refiner/`.
-   This removes saved settings, presets, their backup, and tokenizers inside the
-   extension. Back them up first if needed.
+   This removes tokenizers stored inside the extension. Options and presets stay
+   in Forge's `config.json` as `prompt_refiner_*` entries; they are unused once the
+   extension is removed. Copy your presets text from Settings first if needed.
 2. Delete downloaded LM heads in `<forge>/models/prompt_refiner/lm_heads/`.
    These are outside the extension folder and must be removed separately.
 3. Remove any tokenizer or head files you placed elsewhere if no longer needed,
