@@ -58,6 +58,11 @@ in VRAM spills into shared system memory on Windows. Any of these can drop outpu
 to seconds or even minutes per token. Without an NVIDIA GPU, refinement runs on
 the CPU. **Model details** shows the device, execution path, and memory use.
 
+**Keep input embeddings in system RAM** (Settings, on by default) keeps the input
+embedding table of larger encoders out of VRAM: about 2 GB for Qwen3.5 9B. Each
+token only reads one row of it, so generation speed is practically unchanged, and
+on an 8 GB card it can be the difference between fitting in VRAM and spilling.
+
 ## Supported encoders
 
 | Encoder family | Common Forge Neo use |

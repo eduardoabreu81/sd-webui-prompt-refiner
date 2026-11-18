@@ -40,6 +40,7 @@ if str(EXT_DIR) not in sys.path:
 from prompt_refiner_lib import checkpoints, models  # noqa: E402
 from prompt_refiner_lib.sampling import SAMPLING_DEFAULTS, sampling_kwargs  # noqa: E402
 from prompt_refiner_lib.lm_heads import KNOWN_HEAD_SOURCES, MissingLMHeadError  # noqa: E402
+from prompt_refiner_lib.offload import HostEmbedding, host_embeddings  # noqa: E402
 from prompt_refiner_lib.quantization import PackedLinear, QuantLinear, _FP8_TRITON, _TRITON  # noqa: E402
 
 PRESETS_FILE = EXT_DIR / "presets.json"
@@ -421,7 +422,7 @@ def _free_forge_vram():
 
 
 def _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram, keep_q=True, compress=False,
-               lm_choice="Auto", family="Auto", tokenizer_override=""):
+               lm_choice="Auto", family="Auto", tokenizer_override="", host_embed=True):
     """Cache a model only while its weights, configuration, and tokenizer stay unchanged."""
     path = _ENCODER_PATHS.get(encoder_name)
     if path is None:
@@ -440,7 +441,7 @@ def _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram
     watched.extend(sorted(tokenizer_dir.glob("*")))
     watched.extend(sorted(LM_HEAD_DIR.glob("*.safetensors")))
     key = (tuple(stamp(p) for p in watched), device, str(dtype), rope_choice, bool(keep_q),
-           bool(compress), lm_choice, family, str(tokenizer_dir))
+           bool(compress), lm_choice, family, str(tokenizer_dir), bool(host_embed))
 
     if _STATE["key"] == key and _STATE["model"] is not None:
         return _STATE["model"], _STATE["tokenizer"], device
@@ -452,6 +453,10 @@ def _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram
     tokenizer = models.load_tokenizer(tokenizer_dir, resolved)
     model, info = build_model(path, dtype, rope_choice, device, keep_q, compress, lm_choice, family)
     info += f"; tokenizer: {tokenizer_dir}"
+    if device == "cuda" and host_embed:
+        freed = host_embeddings(model)  # before the move, so the table never reaches VRAM
+        if freed:
+            info += f"; input embeddings in system RAM ({freed / 1e9:.2f} GB kept off the GPU)"
     model.to(device)  # no dtype argument on purpose: keeps rotary buffers in fp32
 
     _STATE.update(key=key, model=model, tokenizer=tokenizer, info=info)
@@ -552,7 +557,9 @@ def _model_storage_bytes(model):
 
 
 def _describe(model, device):
-    params = list(model.parameters())
+    # Input embeddings kept in system RAM on purpose are not a misplaced weight.
+    host = {id(q) for m in model.modules() if isinstance(m, HostEmbedding) for q in m.parameters()}
+    params = [q for q in model.parameters() if id(q) not in host]
     p = params[0]
     s = f"device {p.device}, {str(p.dtype).replace('torch.', '')}, attention: {getattr(model.config, '_attn_implementation', '?')}"
     nq = getattr(model, "_pr_quant_layers", 0)
@@ -595,7 +602,7 @@ def run_refine(
     encoder_name, prompt, system_prompt, temperature, top_p, top_k, min_p, rep_penalty,
     max_new_tokens, seed, device_choice, dtype_choice, rope_choice, keep_loaded, free_vram, empty_think,
     keep_q=True, compress=False, lm_choice="Auto", family="Auto", tokenizer_override="",
-    presence_penalty=SAMPLING_DEFAULTS["presence_penalty"],
+    presence_penalty=SAMPLING_DEFAULTS["presence_penalty"], host_embed=True,
 ):
     """Generator: streams the result text, a status line and a progress bar while generating."""
     if not prompt or not prompt.strip():
@@ -657,7 +664,7 @@ def run_refine(
             msg = "Preparing selected model..." if cached else "Loading model from file (reading and decoding weights)..."
             yield gr.update(), msg, _bar(None, msg, busy=True)
 
-            model, tokenizer, device = _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram, keep_q, compress, lm_choice, family, tokenizer_override)
+            model, tokenizer, device = _get_model(encoder_name, device_choice, dtype_choice, rope_choice, free_vram, keep_q, compress, lm_choice, family, tokenizer_override, host_embed)
             t_load = time.time() - t0
 
             thinking_only = bool(re.search(r"thinking[-_ ]?2507", encoder_name, re.IGNORECASE))
@@ -899,6 +906,9 @@ def on_ui_settings():
     add("keep_loaded", False, "Keep the refiner model loaded between runs", model_section,
         info="much faster repeated runs; keeps using VRAM while you generate images")
     add("free_vram", True, "Unload Forge's image models from VRAM before loading the refiner model", model_section)
+    add("host_embeddings", True, "Keep input embeddings in system RAM", model_section,
+        info="frees about 1-2 GB of VRAM for Qwen3.5 9B, Qwen3/VL 8B and Qwen2.5-VL 7B at almost no speed cost; "
+             "4B models share this table with the output head and keep it on the GPU")
     add("device", DEVICE_CHOICES[0], "Device", model_section, gr.Radio, {"choices": DEVICE_CHOICES})
     add("dtype", DTYPE_CHOICES[0], "Compute dtype", model_section, gr.Radio, {"choices": DTYPE_CHOICES})
     add("family", "Auto", "Model family", model_section, gr.Dropdown, {"choices": models.FAMILIES},
@@ -930,6 +940,7 @@ def _run(encoder_name, idea, preset_name, source):
         _opt("max_new_tokens"), _opt("seed"), _opt("device"), _opt("dtype"), _opt("rope"),
         _opt("keep_loaded"), _opt("free_vram"), _opt("disable_thinking"), _opt("keep_quantized"), _opt("compress"),
         lm_head, _opt("family"), _opt("tokenizer_directory") or "", _opt("presence_penalty"),
+        _opt("host_embeddings"),
     )
     text = summary = ""
     first = True

@@ -63,6 +63,16 @@ speed or that every 9B/32B export will fit. **Unload Forge's image models from V
 can free memory before loading the encoder. Keeping the refiner loaded occupies
 memory between runs.
 
+**Keep input embeddings in system RAM** (on by default) leaves an untied model's
+input embedding table in RAM when the model runs on CUDA. The table is decoded to
+the compute dtype, so it is larger than in a compressed file: about 2 GB in BF16
+for Qwen3.5 9B, whose file stores it as 1 GB of INT8. Each step moves the token
+ids to the CPU and only the looked-up rows back, a few kilobytes per generated
+token. Tied models (the known Qwen3 0.6B-4B and Qwen3-VL 2B/4B profiles) use the
+same table as their output head, which reads all of it for every token, so they
+keep it on the GPU. **Model details** reports the amount kept off the GPU, and
+**Loaded weights/buffers** counts it under CPU.
+
 - FP8 and INT8/ConvRot are useful starting points when the encoder fits comfortably.
   Supported FP8 storage does not require native FP8 matrix multiplication: the
   extension's fused single-token path reads compressed values directly, and other
