@@ -796,18 +796,22 @@ _PROMPT_JS_STATE = r"""
 
 # Extra-network tags such as <lora:name:1> are not sent to the language model,
 # which would rewrite or drop them.
+#
+# Gradio calls this with the event's inputs followed by its outputs' current
+# values, and sends what it returns to Python as the inputs. The Refine event's
+# inputs are [encoder, idea, preset, original], so only those four are kept.
 READ_PROMPT_JS = r"""
 (...args) => {
 """ + _PROMPT_JS_STATE + r"""
+    const inputs = args.slice(0, 4);
     const current = ta ? ta.value : '';
-    const last = args.length - 1;
-    if (!(args[last] && current === state.applied)) { args[last] = current; }
-    args[1] = args[last]
+    if (!(inputs[3] && current === state.applied)) { inputs[3] = current; }
+    inputs[1] = inputs[3]
         .replace(/<[^<>]+>/g, ' ')
         .replace(/\s*,(\s*,)+/g, ',')
         .replace(/\s+/g, ' ')
         .replace(/^[\s,]+|[\s,]+$/g, '');
-    return args;
+    return inputs;
 }
 """
 
