@@ -5,9 +5,15 @@ in Forge Neo. The extension adds a **Prompt Refiner** accordion to txt2img and
 img2img and runs locally inside Forge, without LM Studio, Ollama, or a separate
 language-model server.
 
-This is a fork of [AMGarkin/sd-webui-prompt-refiner](https://github.com/AMGarkin/sd-webui-prompt-refiner)
-that moves the refiner from its own tab into the generation tabs, refines the
-tab's prompt in place, and keeps its options in Forge's Settings.
+> **All credit for this extension goes to [AMGarkin](https://github.com/AMGarkin)**,
+> author of the original [sd-webui-prompt-refiner](https://github.com/AMGarkin/sd-webui-prompt-refiner).
+> The idea and nearly all of the work are theirs: running Forge's own text encoders
+> as local language models, the model loading and validation, every supported
+> quantization format, the Qwen3.5 decoder, LM head downloads, sampling, presets,
+> and this documentation. This fork mainly rearranges how the refiner fits into
+> Forge's interface, plus a few small additions; see
+> [Changes in this fork](#changes-in-this-fork).
+> Please report problems with this fork here, not to the original repository.
 
 ## Install
 
@@ -164,3 +170,37 @@ without a traceback; supply the matching original HF config as described there.
 
 Keep shared text encoders in Forge's model directories if you still use them for
 image generation. No separate service or Python package uninstall is needed.
+
+## Changes in this fork
+
+Everything not listed here is the original extension by
+[AMGarkin](https://github.com/AMGarkin/sd-webui-prompt-refiner), unchanged.
+
+- The refiner is an accordion in txt2img and img2img instead of its own tab.
+- **Refine prompt** works on the tab's prompt in place, with **Restore original**
+  and re-rolls from the same original; `<lora:...>` and other extra-network tags
+  are kept out of the model and restored.
+- Presets and all options live in **Settings > Prompt Refiner**.
+- Input embeddings of untied encoders can stay in system RAM to save VRAM.
+- LM head downloads report authentication and gated-repository errors as they are.
+
+## Credits and license
+
+Original extension, design, and implementation:
+[AMGarkin/sd-webui-prompt-refiner](https://github.com/AMGarkin/sd-webui-prompt-refiner).
+If this fork is useful to you, the credit and thanks belong there.
+
+Like the original, this fork is licensed under the
+[GNU Affero General Public License v3.0](LICENSE).
+
+---
+
+<div align="center">
+
+Made with ❤️ for the Stable Diffusion community
+
+**[Report Bug](https://github.com/eduardoabreu81/sd-webui-prompt-refiner/issues)** • **[Request Feature](https://github.com/eduardoabreu81/sd-webui-prompt-refiner/issues)** • **[☕ Ko-fi](https://ko-fi.com/eduardoabreu81)**
+
+<sub>More Forge Neo extensions at <a href="https://eduardoabreu81.github.io/">eduardoabreu81.github.io</a></sub>
+
+</div>
